@@ -1,0 +1,335 @@
+#########################################################################################################################
+###################################                                                   ###################################
+################################### Extracting haplotypes from DNA metabarcoding data ###################################
+###################################                                                   ###################################
+#########################################################################################################################
+## Peter Shum | shum.p@hotmail.com
+## the workflow generates haplotype data from DNA metabarcoding of kelp forest species from the Shum et al., (2019) dataset
+## !! Shum, P., Barney, B.T., O’Leary, J.K. and Palumbi, S.R., 2019. 
+## !! Cobble community DNA as a tool to monitor patterns of biodiversity within kelp forest ecosystems. Molecular ecology resources, 19(6), pp.1470-1485.
+
+## !! Shum, P and Palumbi, S.R., 2021.
+## !! TESTING SMALL SCALE ECOLOGICAL GRADIENTS AND INTRASPECIFIC DIFFERENTIATION FOR HUNDREDS OF KELP FOREST SPECIES USING HAPLOTYPES FROM METABARCODING
+## !! Published in Molecular Ecology as part of the Special issue "Environmental DNA for biodiversity and ecosystem monitoring"
+
+
+## This workflow requires OBITools (linux), JAMP (R) and processing scripts
+####    Dependencies    ####
+echo install cdbfasta
+git clone https://github.com/gpertea/cdbfasta.git
+cd cdbfasta/
+make
+
+### OVERVIEW
+## [1] - build the taxonomic database from EMBL using in silico PCR (OBITools)
+## [2] - obtain cobble dataset from NCBI's SRA database
+## [3] - quality control of read R1 and R2 (FastQC & OBITools)
+## [4] - pair-end merging, demultiplexing, read filtering and preparing the data for JAMP (OBITools)
+## [5] - generation of haplotypes using Denoise implemented in JAMP (JAMP)
+## [6] - taxonomic assignment using ecotag (OBITools)
+## [7] - decontam in R to remove contaninants in the haplotype dataset (R)
+## [8] - parse data to generate population genetic datasets for # number of MOTUs (linux)
+
+#########
+## [1] ##
+#########
+###
+## build the COI database and perform in silico PCR using the primers used for PCR amplification
+###
+## Building the database may take some time, so best to build it now
+mkdir EMBL
+cd EMBL
+wget -nH --cut-dirs=4 -Arel_std_\*.dat.gz -m ftp://ftp.ebi.ac.uk/pub/databases/embl/release/std/
+for i in std/*gz; do gunzip; done
+cd ..
+
+mkdir TAXO
+cd TAXO
+wget ftp://ftp.ncbi.nih.gov/pub/taxonomy/taxdump.tar.gz
+tar -zxvf taxdump.tar.gz
+cd ..
+
+## convert embl database for obitools - note "embl_r143" refers to the version 143 of the embl database - adjust as required for future updates
+obiconvert --embl -t ./TAXO/ --ecopcrdb-output=embl_r143 ./EMBL/std/*.dat --skip-on-error
+
+echo COI - Leray/Geller primer set
+## note that the Inosines "I" for the COI primer pair is converted to "N" because OBITools does not recognise this base.
+ecoPCR -d ./EMBL/embl_r143 -e 3 -l 50 -L 1000 GGWACWGGWTGAACWGTWTAYCCYCC TANACYTCNGGRTGNCCRAARAAYCA > coi.v05.ecopcr
+
+echo clean COI database
+obigrep -d taxo_Nov2017/new_taxo_Nov2017 --require-rank=species --require-rank=genus --require-rank=family coi.v05.ecopcr > coi.v05_clean.fasta
+obiannotate --uniq-id coi.v05_clean.fasta > db_coi.v05.fasta
+
+echo done
+
+#######################
+
+#########
+## [2] ##
+#########
+
+# Get the data
+# R1 reads
+mkdir data; cd data
+wget https://sra-pub-src-2.s3.amazonaws.com/SRR9654232/14809R_S1_L001_R1_001.fastq.gz.1 
+mv 14809R_S1_L001_R1_001.fastq.gz.1 14809R_S1_L001_R1_001.fastq.gz
+
+# R2 reads
+wget https://sra-pub-src-2.s3.amazonaws.com/SRR9654232/14809R_S1_L001_R2_001.fastq.gz.1
+mv 14809R_S1_L001_R2_001.fastq.gz.1 14809R_S1_L001_R2_001.fastq.gz
+
+cd ..
+
+####################    quality control and trimming using obitools    ####################
+
+#########
+## [3] ##
+#########
+
+#echo QC of obitools input data
+#echo 1. gunzip data for QC
+
+gunzip -c data/*.gz
+
+#echo 2. fastqc all read R1 and R2
+mkdir fastqc
+$fastqc -o fastqc/ --extract -f fastq *.fastq
+#echo check for length quality, trim accordingly
+
+#echo trimming
+obicut -e 250 14809R_S1_L001_R1_001.fastq > cobb_trim250.R1.fastq
+obicut -e 180 14809R_S1_L001_R2_001.fastq > cobb_trim180.R2.fastq
+
+
+####################    obitools    ####################
+
+#########
+## [4] ##
+#########
+
+#echo Paired-end alignment. Annotate the reads with quality 40 and split the oucobbut in two files
+illuminapairedend -r cobb_trim180.R2.fastq cobb_trim250.R1.fastq | obiannotate -S goodali:'"Good_COBB" if score>40.00 else "Bad_COBB"' | obisplit -t goodali
+
+
+###########
+
+#echo Demultiplexing with ngsfilter
+#echo here use the script "submit_parallel_ngsfilter.sh" to parallelize the ngsfilter command, you need to edit the paths to your Good_cobbleCOI.fastq
+#echo  generated fastq file. This script generates files and folders by splitting the Good_cobble.fastq file into 1000 sequences per file and 100
+#echo files per folder. It will generate  as many files/folders necessary. You can set the split files into whatever you like and it will run each file
+#echo as a separate batch jobs. Typically 1000 sequences per file run in about 2 minutes 40 seconds.
+
+## convert fastq to fasta for parallel processing
+seqtk seq -A Good_COBB.fastq > Good_COBB.fasta
+
+mkdir demulti
+cd demulti
+
+## for parallel processing
+submit_parallel_ngsfilter.sh
+## OR (comment out "#")
+#ngsfilter -t ngsfilter.txt --fasta-output -u unidentified_cobble.fastq Good_cobble.fastq --DEBUG > cobb.filtered.fasta
+
+cd ../
+## run the next nine commands with parallel processing only
+echo Once ngsfilter has complete, e.g. 1-2 hours, concatenate all *.filtered.fasta from all folders
+ngsfilter_results=demulti/
+cat $(find $ngsfilter_results -name '*.filtered.fasta' | xargs)> demulti/cobb.filtered.fasta
+cat $(find $ngsfilter_results -name '*unidentified*' | xargs)> demulti/unidentified.cobb.fasta
+###### check reads number ######
+
+echo sort cobb.filtered.fasta
+grep ">" demulti/cobb.filtered.fasta | sed 's/>//g' | sort -k1.6n > demulti/cobb.filtered_idlist.txt
+cdbfasta demulti/cobb.filtered.fasta -o demulti/cobb.filtered.fasta.index
+cat demulti/cobb.filtered_idlist.txt | cdbyank demulti/cobb.filtered.fasta.index > demulti/cobb.filtered_sorted.fasta
+rm demulti/cobb.filtered.fasta.index
+
+#### Filter reads and check reads number ######
+
+echo Filter the seqs to 313bp in length and with no 'N'
+obigrep -p 'seq_length>312' -p 'seq_length<314' -s '^[ACGT]+$' demulti/cobb.filtered_sorted.fasta > cobb.filtered_length.fasta
+
+echo Calculate stats per sample
+obistat -c sample -a seq_length cobb.filtered_length.fasta > sample_stats_cobb.length_filter.txt
+
+cd ../
+## Here the data is linearized and parsed to contain the first column (read name), sample name and sequence separated by ";"
+awk -f linearizefasta.awk demulti/cobb.filtered_length.fasta | awk '{for(i=5;i<=NF;i++){if($i~/^sample=/){a=$i}} print $1";"a,$NF}' > cobb.filtered.JAMP.fasta
+
+## remove "sample=" from the sample name and then split the data into separate files based on the sample name (column 2) and append the file name for JAMP input for Denoise()
+mkdir jamp_data ; cd jamp_data
+sed 's/sample\=//g' ../cobb.filtered.JAMP.fasta | awk -F";" '{print > $2"_PE_RC_cut_minmax_ee0.2"}'
+## reformat all sample files to fasta format
+for i in *; do awk -F";" '{print $1"\n"$NF}' $i> $i.fasta; done
+## remove non-fasta formated files
+find . -type f ! -name "*.fasta" -exec rm {} \;
+
+#############################################################
+################# JAMP in the R environment #################
+#############################################################
+
+#########
+## [5] ##
+#########
+
+cd ../
+## see https://github.com/VascoElbrecht/JAMP for more details and installation in R
+#Load JAMP in R
+Library(JAMP)
+
+## create folder where data will be stored and create log file
+Empty_folder()
+
+##
+## Move jamp formated files to "A_Empty_Folder/_data/" in the linux environment. Remember for keep the R environment open.
+##
+mv jamp_data/* A_Empty_folder/_data/
+
+## Back in the R environment - store data in "ee"
+ee <- list.files("A_Empty_Folder/_data", full.names=T)
+## Run Denoise with default settings
+## NOTE ## To run various settings e.g. alpha and abundance the Denoise.R script requires editing these parameter values including the run command parameters below
+Denoise(files=ee, minsize=5, minrelsize=0.001, OTUmin=0.01, minHaploPresence=2, poolsample=F, renameSamples="(.*)_PE_RC_RC_cut.*")
+
+## Done. If Denoise was successful, a folder "B_Denoising" will be generated with the haplotype table "E_haplo_table.csv".
+
+
+####################    ecotag taxonomic assignment    ####################
+
+#########
+## [6] ##
+#########
+
+## In Linux, start taxonomic assignment
+# format fasta file
+awk -F, 'NR>1 {print ">"$3"_"$2"\n"$NF}' E_haplo_table.csv | sed 's/"//g' > E_haplo_table.fasta
+
+mkdir ecotag
+cd ecotag
+#echo here use the script "submit_parallel_ecotag.sh" to parallelize the ecotag command, you need to edit the paths to you sumaclust generated 
+#echo fasta file, e.g. cobb.sumaclust95.centers.fasta, and ecopcr database. This script generates files and folders by splitting the 
+#echo cobb.sumaclust95.centers.fasta file into 100 sequences per file and 100 files per folder. It will generate  as many files/folders. 
+#echo You can set the split files into hatever you like and it will run each file as a separate job. Typically 100 sequneces per file run in about ~10-15 minutes.
+
+
+## for parallel processing
+sh submit_parallel_ecotag.sh
+## OR (comment out "#")
+#ecotag -d EMBL/EMBL_r143 -R db_coi.v05.fasta E_haplo_table.fasta > E_haplo.ecotag.fasta
+
+## run the next eight commands with parallel processing only
+echo Once the previous step has complete, e.g. overnight, concatenate all *.ecotag.fasta from all folders
+ecotag_results=ecotag/
+cat $(find $ecotag_results -name '*.ecotag.fasta' | xargs)> ecotag/cobb.ecotag.fasta
+
+echo sort ecotag.fasta  
+grep ">" ecotag/cobb.ecotag.fasta | sed 's/>//g' | sort -k1.6n > ecotag/cobb.ecotag_idlist.txt
+cdbfasta ecotag/cobb.ecotag.fasta -o ecotag/cobb.ecotag.fasta.index
+cat ecotag/cobb.ecotag_idlist.txt | cdbyank ecotag/cobb.ecotag.fasta.index > ecotag/E_haplo.ecotag.fasta
+rm ecotag/cobb.ecotag.fasta.index
+
+
+#get taxonomy
+Rscript owi_add_taxonomy E_haplo.ecotag.fasta E_haplo.ecotag.fasta.annotated.txt
+
+awk -F, '{print $2","$0}' E_haplo_table.csv | sed 's/"//g' > E_haplo_table_tmp.csv
+awk -F ";" 'NR>1 {print $1}' E_haplo.ecotag.fasta.annotated.txt | sed 's/"//g' | sed 's/_haplo/\thaplo/g' | awk '{print $2}' > names
+awk -F',' 'NR==FNR{c[$1]++;next};c[$1] > 0' names E_haplo_table_tmp.csv  > E_final_count.txt
+
+## go to Excel and open E_final_count.txt and E_haplo.ecotag.fasta.annotated.txt and ensure haplotype names match between the taxonomy and count data
+
+####################    Filter data as required e.g. decontam in R    ####################
+
+#########
+## [7] ##
+#########
+
+## Format data for Phyloseq input
+#BiocManager::install("decontam")
+library(decontam)
+library(phyloseq)
+library(ggplot2)
+
+#load data
+	count_tab<-read.csv("OTU.csv",header=T, row.names=1, check.names=F)
+	#Transpose the data to have sample names on rows
+	count_tab<-t(count_tab)
+	sample_info_tab<-read.csv("meta.csv",header=T, row.names=1, check.names=F)
+	#Just a check to ensure that the samples in sample_info_tab are in the same order as in count_tab
+	sample_info_tab<-sample_info_tab[rownames(count_tab),]
+	tax_tab<-read.csv("taxo.csv",header=T, row.names=1, check.names=F)
+	
+# create phyloseq object
+	OTU = otu_table(as.matrix(count_tab), taxa_are_rows = FALSE)
+	TAX = tax_table(as.matrix(tax_tab))
+	SAM = sample_data(sample_info_tab)
+	haplocobb <- merge_phyloseq(phyloseq(OTU, TAX), SAM)
+
+# decontam
+	head(sample_data(haplocobb))
+	df <- as.data.frame(sample_data(haplocobb)) # Put sample_data into a ggplot-friendly data.frame
+	df$LibrarySize <- sample_sums(haplocobb)
+	df <- df[order(df$LibrarySize),]
+	df$Index <- seq(nrow(df))
+	ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point()
+
+# identify contaminants (prevelance)
+	sample_data(haplocobb)$is.neg <- sample_data(haplocobb)$Sample_or_Control == "Control Sample"
+	contamdf.prev <- isContaminant(haplocobb, method="prevalence", neg="is.neg")
+	table(contamdf.prev$contaminant)
+
+	head(which(contamdf.prev$contaminant))
+	
+# contaminants at 0.5 threshold
+	contamdf.prev05 <- isContaminant(haplocobb, method="prevalence", neg="is.neg", threshold=0.5)
+	table(contamdf.prev05$contaminant)
+	
+# Make phyloseq object of presence-absence in negative controls and true samples
+	haplocobb.pa <- transform_sample_counts(haplocobb, function(abund) 1*(abund>0))
+	haplocobb.pa.neg <- prune_samples(sample_data(haplocobb.pa)$Sample_or_Control == "Control Sample", haplocobb.pa)
+	haplocobb.pa.pos <- prune_samples(sample_data(haplocobb.pa)$Sample_or_Control == "True Sample", haplocobb.pa)
+	# Make data.frame of prevalence in positive and negative samples
+	df.pa <- data.frame(pa.pos=taxa_sums(haplocobb.pa.pos), pa.neg=taxa_sums(haplocobb.pa.neg), contaminant=contamdf.prev$contaminant)
+	ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() + xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+
+# write prevelence data at 0.5% to file
+write.csv(contamdf.prev05, file="haploCOBB_contamdf.prev05.csv")
+## removed contaminants from df.pa and save file with OTUs, haplotypes, taxonomy information, abundance information and sequence 
+
+####################    Generate Population Genetic haplotype data per MOTU from DNA metabarcoding (command line - linux)   ####################
+
+#########
+## [8] ##
+#########
+
+## To generate population genetic haplotype data per MOTU
+## 1) in excel, for each haplotype obtain presence/absence in a separate column e.g. "=countif(X-Z,">0")" where X-Z are row cells with abundance data
+## 2) save in csv file called "E_haplo_cleaned_PAM.csv"
+
+mkdir MOTUs 
+
+#################
+## The final excel file may differ from dataset to dataset but the following data parsing refers to the following columns:
+# id = $7
+# pam = $6
+# haplotype = $2
+# OTU = $3
+# phylum_name = $13
+# sequences = $NF
+
+## first parse the information we want
+awk -F, '{print $7","$6","$2","$3","$13","$NF}' E_haplo_cleaned_PAM.csv > E_haplo_split.csv
+## second duplicate rows based on the value in the corresponding column e.g. PAM (refers to number of individuals per haplotye across all samples) and unique line numbers to each line 
+## (we do this to give each haplotype a unique header for further downstream analysis)
+awk -F, 'NR>1{for(i=1;i<=$2;i++)print $0}' final_split.csv | awk -F, '{$1=$1+NR-1;print}' OFS=, > MOTUs/haplo
+
+
+cd MOTUs
+mkdir fasta
+## generate separate txt files by grouping information from column 4 (OTU name) and rename all OTU files e.g. "OTU_10" to "Annelida_OTU_10.txt"
+awk -F, '{print > $4}' haplo
+for i in OTU_*; do cp $i $(awk -F, '{print $5}' $i | awk 'NR==1')_$i.txt; done
+
+## reformat all ".txt" files for fasta format and append the header names to include the line number to the end of the haplotype name
+for i in $(ls *txt | cut -d "." -f 1); do awk -F, '{print ">"$3$1"\n"$NF}' ${i##*/}.txt > fasta/${i##*/}.fasta ; done
+## done
